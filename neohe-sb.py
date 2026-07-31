@@ -12,7 +12,6 @@ from seleniumbase import SB
 
 NEOH_AUTH = os.environ.get("NEOH_AUTH", "")
 NEOH_COOKIE = os.environ.get("NEOH_COOKIE", "").strip()
-#NEOH_COOKIE = os.environ.get("NEOH_COOKIE","")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 PROXY = os.environ.get("PROXY", "socks://127.0.0.1:1080")
@@ -179,12 +178,18 @@ def save_login_failure(sb, reason):
     except Exception as exc:
         print(f"⚠️ 保存或发送登录失败截图异常：{exc}")
 
+# ==========================================
+# 核心修复：更强力的弹窗/GDPR 隐私授权清理器
+# ==========================================
 def dismiss_popups(sb):
     selectors = [
         "#dismiss-button",
         "#dismiss-button-element",
         ".close-button-outer",
         '[aria-label="Fermer l\'annonce"]',
+        ".fc-cta-consent",          # 常见 Google Funding Choices 弹窗
+        "button.fc-primary-button",
+        ".cmpboxbtn-yes"
     ]
     closed = 0
     for _ in range(3):
@@ -194,8 +199,33 @@ def dismiss_popups(sb):
         if click_element(sb, element, selector):
             closed += 1
             time.sleep(0.4)
+
+    # 针对欧洲 GDPR "Consent" 授权框的底层 JS 暴力破解
+    try:
+        js_click = sb.execute_script("""
+            var clicked = false;
+            // 寻找网页上所有的按钮、文字标签或超链接
+            var elems = document.querySelectorAll('button, p.fc-button-label, a, span');
+            for (var i = 0; i < elems.length; i++) {
+                var text = elems[i].innerText.trim().toLowerCase();
+                // 如果发现同意/接受的特征词，直接强制点击
+                if (text === 'consent' || text === 'accepter' || text === 'accept all' || text === 'agree' || text === 'tout accepter' || text === 'i accept') {
+                    elems[i].click();
+                    clicked = true;
+                    break;
+                }
+            }
+            return clicked;
+        """)
+        if js_click:
+            print("🔕 [自动防御] 已通过底层 JS 自动同意 GDPR 隐私弹窗 (Consent)")
+            closed += 1
+            time.sleep(1)
+    except:
+        pass
+
     if closed:
-        print(f"🔕 已关闭弹窗 {closed} 次")
+        print(f"🔕 已关闭弹窗/隐私授权 {closed} 次")
     return closed
 
 
@@ -349,6 +379,7 @@ def save_captcha_checkpoint(sb):
 
 def solve_login_turnstile(sb):
     print("🛡 处理登录页 Turnstile...")
+    dismiss_popups(sb) # 在点验证码前强制扫清一次障碍
     result = handle_cloudflare_challenge(sb, extra_sleep=8.0, max_retries=3)
     if result["success"]:
         print("✅ 登录页 Cloudflare 挑战已通过")
@@ -672,6 +703,7 @@ def round_captcha_state(sb):
 
 def wait_for_round_captcha(sb):
     print("⏳ 等待本轮 Turnstile 组件出现...")
+    dismiss_popups(sb) # 👈 关键修复：在此处预扫除同意框，绝杀！
     deadline = time.monotonic() + 20.0
     while time.monotonic() < deadline:
         try:
@@ -766,7 +798,7 @@ def handle_cloudflare_challenge(sb: SB, extra_sleep: float = 8.0, max_retries: i
 
         result["challenge_handled"] = True
         print("🛡 检测到 Cloudflare 挑战，开始处理...")
-        # configure_browser_window(sb)
+        dismiss_popups(sb) # 👈 再次确保处理前无遮挡
         start_url = current_url(sb) or ""
 
         for attempt in range(1, max_retries + 1):
