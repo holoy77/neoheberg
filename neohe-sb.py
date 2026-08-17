@@ -293,32 +293,32 @@ def solve_login_turnstile(sb: SB, max_retries: int = 3, wait_per_try: int = 8) -
 
 
 # ==========================================================
-# 2. 广告页专属：自建 CapJS 方框模拟点击器
+# 2. 广告页专属：精准点击自建 Cap 验证方框 (图三)
 # ==========================================================
-def click_custom_checkbox(sb: SB) -> bool:
+def click_cap_checkbox(sb: SB) -> bool:
     dismiss_popups(sb)
 
+    # 1. 底层 JS 穿透模拟物理点击（精确寻找带有 Vérifiez que vous êtes humain 或 Cap 的勾选方框）
     clicked = sb.execute_script("""
-        var checkboxes = document.querySelectorAll('input[type="checkbox"]');
-        for (var i = 0; i < checkboxes.length; i++) {
-            if (!checkboxes[i].checked) {
-                checkboxes[i].scrollIntoView({block: 'center'});
-                ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(evt => {
-                    checkboxes[i].dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
-                });
-                return true;
-            }
-        }
-
-        var all = document.querySelectorAll('div, label, span, p, button');
-        for (var j = 0; j < all.length; j++) {
-            var el = all[j];
+        var all = document.querySelectorAll('div, label, span, p, button, input');
+        for (var i = 0; i < all.length; i++) {
+            var el = all[i];
             var txt = (el.innerText || '').toLowerCase();
-            if (txt.includes('vérifiez que vous êtes humain') || txt.includes('verifiez que vous etes humain')) {
-                var target = el.querySelector('input, span, div') || el;
-                target.scrollIntoView({block: 'center'});
+            if (txt.includes('vérifiez') || txt.includes('humai') || txt.includes('cap')) {
+                var box = el.querySelector('input, span, div, svg') || el;
+                box.scrollIntoView({block: 'center'});
+                var rect = box.getBoundingClientRect();
+                
+                // 模拟原生 Pointer 与 Mouse 事件
                 ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(evt => {
-                    target.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
+                    var event = new MouseEvent(evt, {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        clientX: rect.left + 15,
+                        clientY: rect.top + rect.height / 2
+                    });
+                    box.dispatchEvent(event);
                 });
                 return true;
             }
@@ -327,19 +327,20 @@ def click_custom_checkbox(sb: SB) -> bool:
     """)
 
     if clicked:
-        print("✅ 成功命中并点击了验证方框！")
+        print("✅ 成功命中并点击了 Cap 自建验证方框！")
         return True
 
+    # 2. 备用通用选择器点击
     selectors = [
         "input[type='checkbox']",
         "label:contains('Vérifiez')",
-        "div:contains('Vérifiez que vous êtes humain')",
+        "div:contains('Vérifiez que vous êtes humai')",
         ".captcha-checkbox",
         "#cap-checkbox",
     ]
     element, sel = visible_element(sb, selectors)
     if element and click_element(sb, element, sel):
-        print(f"✅ 成功点击选择器：{sel}")
+        print(f"✅ 成功通过选择器点击验证方框：{sel}")
         return True
 
     return False
@@ -490,32 +491,44 @@ def wait_for_clipurl(sb):
 
 
 # ==========================================================
-# 3. ClipURL 4 步流执行逻辑
+# 3. ClipURL 4 步流执行逻辑 (适配倒计时与自建方框)
 # ==========================================================
 def solve_clipurl_pipeline(sb):
     print("🚀 开始执行 ClipURL 4 步流程...")
     sb.wait_for_ready_state_complete()
     dismiss_popups(sb)
 
-    # 步骤 1: 首页方框点击
+    # 1. 步骤 1/4: 初始验证方框点击
     print("🛡 [步骤 1/4] 点击首页自建验证方框...")
-    for _ in range(5):
-        if click_custom_checkbox(sb):
+    for _ in range(3):
+        if click_cap_checkbox(sb):
             break
         time.sleep(1)
 
-    # 步骤 2 & 3: 缓冲与 Attente
-    print("⏳ [步骤 2 & 3] 等待系统推进与缓冲倒计时...")
-    time.sleep(5)
-    dismiss_popups(sb)
-
-    # 步骤 4: 最终 Vérif 验证
-    print("🛡 [步骤 4/4] 点击最终 Vérif 验证方框...")
-    for _ in range(5):
-        click_custom_checkbox(sb)
+    # 2. 步骤 2 & 3: 监听前端倒计时（Redirection en cours / window.__REDIRECT__）
+    print("⏳ [步骤 2 & 3] 监听倒计时缓冲完成...")
+    start_wait = time.monotonic()
+    while time.monotonic() - start_wait < 15:
+        dismiss_popups(sb)
+        is_counting = sb.execute_script("""
+            var text = document.body ? document.body.innerText : '';
+            var hasRedirectObj = (window.__REDIRECT__ && window.__REDIRECT__.remaining > 0);
+            return text.includes('Redirection en cours') || hasRedirectObj;
+        """)
+        if not is_counting:
+            print("✅ 倒计时已归零/进入下一步！")
+            break
         time.sleep(1)
 
-    # 等待自动跳回 NeoHeberg
+    time.sleep(1.5)
+
+    # 3. 步骤 4/4: 点击最终 Vérif 验证方框 (图三)
+    print("🛡 [步骤 4/4] 寻找并点击最终 Vérif 验证方框...")
+    for _ in range(5):
+        click_cap_checkbox(sb)
+        time.sleep(1)
+
+    # 4. 等待自动跳回 NeoHeberg 控制台
     print("⏳ 等待页面跳转回 NeoHeberg 控制台...")
     deadline = time.monotonic() + 35.0
     while time.monotonic() < deadline:
@@ -539,7 +552,8 @@ def solve_clipurl_pipeline(sb):
                 sb.driver.switch_to.window(current_handle)
             return True
 
-        click_custom_checkbox(sb)
+        # 如果还在原页面，尝试再次补点验证方框
+        click_cap_checkbox(sb)
         time.sleep(1.5)
 
     return "dash.neoheberg.fr" in current_url(sb) and "/login" not in current_url(sb)
@@ -582,7 +596,7 @@ def run():
         print("❌ 必须设置 NEOH_COOKIE 或 NEOH_AUTH")
         return 1
 
-    print("🚀 启动 NeoHeberg 自动续赚脚本")
+    print("🚀 启动 NeoHeberg 自动续赚脚本 (完整稳定版)")
     if PROXY:
         print(f"🌐 使用代理：{PROXY}")
 
@@ -617,11 +631,13 @@ def run():
             rounds = 0
             fail_streak = 0
             while True:
+                # 1. 点击 Commencer 按钮
                 if not start_round(sb):
                     if not restart_ad_flow(sb, "未能点击 Commencer"):
                         return 1
                     time.sleep(2)
 
+                # 2. 等待进入广告页面
                 if not wait_for_clipurl(sb):
                     fail_streak += 1
                     if fail_streak >= MAX_CAPTCHA_FAILURES:
@@ -629,6 +645,7 @@ def run():
                     restart_ad_flow(sb, "未进入 clipurl")
                     continue
 
+                # 3. 运行 ClipURL 4 步流
                 if not solve_clipurl_pipeline(sb):
                     fail_streak += 1
                     shot_name = f"clipurl_failed_round_{rounds + 1}.png"
