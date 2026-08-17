@@ -241,49 +241,65 @@ def read_coins(sb):
         return None
 
 
-def solve_turnstile(sb: SB, max_retries: int = 3, wait_per_try: int = 8) -> bool:
-    for attempt in range(1, max_retries + 1):
-        dismiss_popups(sb)
+# ==========================================================
+# 核心改造：针对自建人机方框（CapJS / Custom Box）的强力点击器
+# ==========================================================
+def click_custom_checkbox(sb: SB) -> bool:
+    """
+    寻找并真实触发 'Vérifiez que vous êtes humain' 或对应方框的点击
+    """
+    dismiss_popups(sb)
+    
+    # 优先通过 JS 穿透直接定位包含文本的容器或 input checkbox
+    clicked = sb.execute_script("""
+        var found = false;
+        
+        // 1. 寻找显式的 input checkbox
+        var checkboxes = document.querySelectorAll('input[type="checkbox"]');
+        for (var i = 0; i < checkboxes.length; i++) {
+            if (!checkboxes[i].checked) {
+                checkboxes[i].scrollIntoView({block: 'center'});
+                ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(evt => {
+                    checkboxes[i].dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
+                });
+                return true;
+            }
+        }
+        
+        // 2. 寻找包含 'Vérifiez que vous êtes humain' 的元素或其父容器
+        var all = document.querySelectorAll('div, label, span, p, button');
+        for (var j = 0; j < all.length; j++) {
+            var el = all[j];
+            var txt = (el.innerText || '').toLowerCase();
+            if (txt.includes('vérifiez que vous êtes humain') || txt.includes('verifiez que vous etes humain')) {
+                // 查找该容器内部或附近的方框
+                var target = el.querySelector('input, span, div') || el;
+                target.scrollIntoView({block: 'center'});
+                ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(evt => {
+                    target.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
+                });
+                return true;
+            }
+        }
+        return false;
+    """)
 
-        has_passed = sb.execute_script("""
-            var tokens = [...document.querySelectorAll('input[name="cf-turnstile-response"]')];
-            return tokens.some(t => t.value && t.value.length > 20);
-        """)
-        if has_passed:
-            print("✅ Cloudflare 验证已生成有效 Token！")
-            return True
+    if clicked:
+        print("✅ 成功命中并点击了验证方框！")
+        return True
 
-        print(f"🛡 [第 {attempt}/{max_retries} 次尝试] 触发 Cloudflare 验证点击...")
-        try:
-            sb.uc_gui_click_captcha()
-        except Exception:
-            pass
-
-        try:
-            sb.execute_script("""
-                var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                if (iframe) {
-                    var rect = iframe.getBoundingClientRect();
-                    var x = rect.left + rect.width / 2;
-                    var y = rect.top + rect.height / 2;
-                    var el = document.elementFromPoint(x, y);
-                    if (el) el.click();
-                }
-            """)
-        except Exception:
-            pass
-
-        deadline = time.monotonic() + wait_per_try
-        while time.monotonic() < deadline:
-            time.sleep(1)
-            token_ready = sb.execute_script("""
-                var tokens = [...document.querySelectorAll('input[name="cf-turnstile-response"]')];
-                return tokens.some(t => t.value && t.value.length > 20);
-            """)
-            if token_ready or "dash.neoheberg.fr" in current_url(sb):
-                print("✅ Cloudflare 挑战通过！")
-                time.sleep(1.5)
-                return True
+    # 备用方案：尝试 SeleniumBase 原生尝试
+    selectors = [
+        "input[type='checkbox']",
+        "label:contains('Vérifiez')",
+        "div:contains('Vérifiez que vous êtes humain')",
+        ".captcha-checkbox",
+        "#cap-checkbox"
+    ]
+    element, sel = visible_element(sb, selectors)
+    if element and click_element(sb, element, sel):
+        print(f"✅ 成功点击选择器：{sel}")
+        return True
 
     return False
 
@@ -344,7 +360,9 @@ def login(sb):
     if not ensure_login_fields(sb):
         return False
 
-    solve_turnstile(sb, max_retries=2, wait_per_try=6)
+    # 登录页尝试点击验证码方框
+    click_custom_checkbox(sb)
+    time.sleep(2)
 
     submit_selector = 'form[action="./login"] button[type="submit"]'
     if not wait_until(lambda: bool(visible_element(sb, [submit_selector])[0]), 10):
@@ -432,32 +450,34 @@ def wait_for_clipurl(sb):
 
 
 # ==========================================================
-# 核心策略：遇到 Mini-jeu 直接快速回退重开
+# 核心流水线：精准适配自建 CapJS 4 步流
 # ==========================================================
 def solve_clipurl_pipeline(sb):
-    print("🚀 开始执行 ClipURL 流程...")
+    print("🚀 开始执行 ClipURL 4 步流程...")
     sb.wait_for_ready_state_complete()
     dismiss_popups(sb)
 
-    # 1. 检查是否存在 CAPTCHA 并处理
-    if "challenges.cloudflare.com" in sb.get_page_source():
-        print("🛡 遇到 Cloudflare CAPTCHA，执行验证...")
-        solve_turnstile(sb, max_retries=2, wait_per_try=6)
+    # 1. 步骤 1 (CAPTCHA 方框点击)
+    print("🛡 [步骤 1/4] 执行首页自建验证方框点击...")
+    for _ in range(5):
+        if click_custom_checkbox(sb):
+            break
+        time.sleep(1)
 
-    # 2. 检查是否出现 Mini-jeu
-    page_text = (sb.get_page_source() or "").lower()
-    if "mini-jeu" in page_text or "attrapez la cible" in page_text or "cliquez" in page_text:
-        print("🛑 检测到 Mini-jeu（小游戏验证模式），按策略直接放弃本轮并回退重新开始！")
-        return False
+    # 2. 步骤 2 & 3 (Mini-jeu / Attente 自动缓冲)
+    print("⏳ [步骤 2 & 3] 等待系统自动推进与 Attente 倒计时...")
+    time.sleep(5)
+    dismiss_popups(sb)
 
-    # 3. 如果是普通 Attente / 倒计时模式，等待并处理最终验证
-    print("⏳ 处理后续步骤与最终安全验证...")
-    time.sleep(3)
-    solve_turnstile(sb, max_retries=2, wait_per_try=6)
+    # 3. 步骤 4 (Vérif 最终方框点击)
+    print("🛡 [步骤 4/4] 尝试执行最终 Vérif 验证方框点击...")
+    for _ in range(5):
+        click_custom_checkbox(sb)
+        time.sleep(1)
 
     # 4. 等待跳转回 NeoHeberg
-    print("⏳ 等待页面跳转回 NeoHeberg...")
-    deadline = time.monotonic() + 25.0
+    print("⏳ 等待页面跳转回 NeoHeberg 控制台...")
+    deadline = time.monotonic() + 35.0
     while time.monotonic() < deadline:
         dismiss_popups(sb)
 
@@ -469,7 +489,8 @@ def solve_clipurl_pipeline(sb):
                     break
 
         url = current_url(sb)
-        if "dash.neoheberg.fr" in url:
+        # 只要回到 dash.neoheberg.fr 且不是登录页，即代表成功结算
+        if "dash.neoheberg.fr" in url and "/login" not in url:
             print(f"🎉 页面已成功跳转回 NeoHeberg：{url}")
             if len(sb.driver.window_handles) > 1:
                 current_handle = sb.driver.current_window_handle
@@ -480,23 +501,11 @@ def solve_clipurl_pipeline(sb):
                 sb.driver.switch_to.window(current_handle)
             return True
 
-        # 再次检查是否有突发 mini-jeu
-        if "mini-jeu" in (sb.get_page_source() or "").lower():
-            print("🛑 流程中途出现 Mini-jeu，立即回退重开！")
-            return False
-
-        try:
-            sb.execute_script("""
-                var btns = [...document.querySelectorAll('button, a')];
-                var cBtn = btns.find(b => /obtenir|continuer|claim|continue/i.test(b.innerText));
-                if (cBtn) cBtn.click();
-            """)
-        except Exception:
-            pass
-
+        # 如果有未勾选的方框，再次尝试补点
+        click_custom_checkbox(sb)
         time.sleep(1.5)
 
-    return "dash.neoheberg.fr" in current_url(sb)
+    return "dash.neoheberg.fr" in current_url(sb) and "/login" not in current_url(sb)
 
 
 def report_coins(sb, reason):
@@ -536,7 +545,7 @@ def run():
         print("❌ 必须设置 NEOH_COOKIE 或 NEOH_AUTH")
         return 1
 
-    print("🚀 启动 NeoHeberg 自动续赚脚本 (遇 Mini-jeu 自动回退重开版)")
+    print("🚀 启动 NeoHeberg 自动续赚脚本 (自建方框智能穿透版)")
     if PROXY:
         print(f"🌐 使用代理：{PROXY}")
 
@@ -585,14 +594,14 @@ def run():
                     restart_ad_flow(sb, "未进入 clipurl")
                     continue
 
-                # 3. 运行 ClipURL 流程（若遇到 Mini-jeu 自动返回 False 并重开）
+                # 3. 运行 ClipURL 4 步流
                 if not solve_clipurl_pipeline(sb):
                     fail_streak += 1
                     shot_name = f"clipurl_failed_round_{rounds + 1}.png"
                     try:
                         sb.save_screenshot(shot_name)
                         print(f"📸 已自动保存失败现场截图：{shot_name}")
-                        send_tg_photo(shot_name, f"ClipURL 第 {rounds + 1} 轮放弃/失败重开\nURL: {current_url(sb)}")
+                        send_tg_photo(shot_name, f"ClipURL 第 {rounds + 1} 轮未完成\nURL: {current_url(sb)}")
                     except Exception:
                         pass
 
@@ -600,7 +609,7 @@ def run():
                     if fail_streak >= MAX_CAPTCHA_FAILURES:
                         print("🛑 连续失败达到上限，退出")
                         return 1
-                    restart_ad_flow(sb, "Mini-jeu 回退或流程未完成")
+                    restart_ad_flow(sb, "流程未完成")
                     continue
 
                 fail_streak = 0
