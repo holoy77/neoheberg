@@ -242,19 +242,63 @@ def read_coins(sb):
 
 
 # ==========================================================
-# 核心改造：针对自建人机方框（CapJS / Custom Box）的强力点击器
+# 1. 登录页专属：Cloudflare Turnstile 验证器
+# ==========================================================
+def solve_login_turnstile(sb: SB, max_retries: int = 3, wait_per_try: int = 8) -> bool:
+    print("🛡 处理登录页 Cloudflare Turnstile 验证...")
+    for attempt in range(1, max_retries + 1):
+        dismiss_popups(sb)
+
+        has_passed = sb.execute_script("""
+            var tokens = [...document.querySelectorAll('input[name="cf-turnstile-response"]')];
+            return tokens.some(t => t.value && t.value.length > 20);
+        """)
+        if has_passed:
+            print("✅ 登录页 Cloudflare 验证已生成有效 Token！")
+            return True
+
+        print(f"🛡 [登录页第 {attempt}/{max_retries} 次尝试] 触发 Turnstile 点击...")
+        try:
+            sb.uc_gui_click_captcha()
+        except Exception:
+            pass
+
+        try:
+            sb.execute_script("""
+                var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                if (iframe) {
+                    var rect = iframe.getBoundingClientRect();
+                    var x = rect.left + rect.width / 2;
+                    var y = rect.top + rect.height / 2;
+                    var el = document.elementFromPoint(x, y);
+                    if (el) el.click();
+                }
+            """)
+        except Exception:
+            pass
+
+        deadline = time.monotonic() + wait_per_try
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            token_ready = sb.execute_script("""
+                var tokens = [...document.querySelectorAll('input[name="cf-turnstile-response"]')];
+                return tokens.some(t => t.value && t.value.length > 20);
+            """)
+            if token_ready or "dash.neoheberg.fr" in current_url(sb) and "/login" not in current_url(sb):
+                print("✅ 登录页 Cloudflare 挑战通过！")
+                time.sleep(1.5)
+                return True
+
+    return False
+
+
+# ==========================================================
+# 2. 广告页专属：自建 CapJS 方框模拟点击器
 # ==========================================================
 def click_custom_checkbox(sb: SB) -> bool:
-    """
-    寻找并真实触发 'Vérifiez que vous êtes humain' 或对应方框的点击
-    """
     dismiss_popups(sb)
-    
-    # 优先通过 JS 穿透直接定位包含文本的容器或 input checkbox
+
     clicked = sb.execute_script("""
-        var found = false;
-        
-        // 1. 寻找显式的 input checkbox
         var checkboxes = document.querySelectorAll('input[type="checkbox"]');
         for (var i = 0; i < checkboxes.length; i++) {
             if (!checkboxes[i].checked) {
@@ -265,14 +309,12 @@ def click_custom_checkbox(sb: SB) -> bool:
                 return true;
             }
         }
-        
-        // 2. 寻找包含 'Vérifiez que vous êtes humain' 的元素或其父容器
+
         var all = document.querySelectorAll('div, label, span, p, button');
         for (var j = 0; j < all.length; j++) {
             var el = all[j];
             var txt = (el.innerText || '').toLowerCase();
             if (txt.includes('vérifiez que vous êtes humain') || txt.includes('verifiez que vous etes humain')) {
-                // 查找该容器内部或附近的方框
                 var target = el.querySelector('input, span, div') || el;
                 target.scrollIntoView({block: 'center'});
                 ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(evt => {
@@ -288,13 +330,12 @@ def click_custom_checkbox(sb: SB) -> bool:
         print("✅ 成功命中并点击了验证方框！")
         return True
 
-    # 备用方案：尝试 SeleniumBase 原生尝试
     selectors = [
         "input[type='checkbox']",
         "label:contains('Vérifiez')",
         "div:contains('Vérifiez que vous êtes humain')",
         ".captcha-checkbox",
-        "#cap-checkbox"
+        "#cap-checkbox",
     ]
     element, sel = visible_element(sb, selectors)
     if element and click_element(sb, element, sel):
@@ -360,9 +401,8 @@ def login(sb):
     if not ensure_login_fields(sb):
         return False
 
-    # 登录页尝试点击验证码方框
-    click_custom_checkbox(sb)
-    time.sleep(2)
+    # 登录页过 Cloudflare Turnstile
+    solve_login_turnstile(sb, max_retries=3, wait_per_try=6)
 
     submit_selector = 'form[action="./login"] button[type="submit"]'
     if not wait_until(lambda: bool(visible_element(sb, [submit_selector])[0]), 10):
@@ -450,38 +490,37 @@ def wait_for_clipurl(sb):
 
 
 # ==========================================================
-# 核心流水线：精准适配自建 CapJS 4 步流
+# 3. ClipURL 4 步流执行逻辑
 # ==========================================================
 def solve_clipurl_pipeline(sb):
     print("🚀 开始执行 ClipURL 4 步流程...")
     sb.wait_for_ready_state_complete()
     dismiss_popups(sb)
 
-    # 1. 步骤 1 (CAPTCHA 方框点击)
-    print("🛡 [步骤 1/4] 执行首页自建验证方框点击...")
+    # 步骤 1: 首页方框点击
+    print("🛡 [步骤 1/4] 点击首页自建验证方框...")
     for _ in range(5):
         if click_custom_checkbox(sb):
             break
         time.sleep(1)
 
-    # 2. 步骤 2 & 3 (Mini-jeu / Attente 自动缓冲)
-    print("⏳ [步骤 2 & 3] 等待系统自动推进与 Attente 倒计时...")
+    # 步骤 2 & 3: 缓冲与 Attente
+    print("⏳ [步骤 2 & 3] 等待系统推进与缓冲倒计时...")
     time.sleep(5)
     dismiss_popups(sb)
 
-    # 3. 步骤 4 (Vérif 最终方框点击)
-    print("🛡 [步骤 4/4] 尝试执行最终 Vérif 验证方框点击...")
+    # 步骤 4: 最终 Vérif 验证
+    print("🛡 [步骤 4/4] 点击最终 Vérif 验证方框...")
     for _ in range(5):
         click_custom_checkbox(sb)
         time.sleep(1)
 
-    # 4. 等待跳转回 NeoHeberg
+    # 等待自动跳回 NeoHeberg
     print("⏳ 等待页面跳转回 NeoHeberg 控制台...")
     deadline = time.monotonic() + 35.0
     while time.monotonic() < deadline:
         dismiss_popups(sb)
 
-        # 检查多标签页
         if len(sb.driver.window_handles) > 1:
             for handle in sb.driver.window_handles:
                 sb.driver.switch_to.window(handle)
@@ -489,7 +528,6 @@ def solve_clipurl_pipeline(sb):
                     break
 
         url = current_url(sb)
-        # 只要回到 dash.neoheberg.fr 且不是登录页，即代表成功结算
         if "dash.neoheberg.fr" in url and "/login" not in url:
             print(f"🎉 页面已成功跳转回 NeoHeberg：{url}")
             if len(sb.driver.window_handles) > 1:
@@ -501,7 +539,6 @@ def solve_clipurl_pipeline(sb):
                 sb.driver.switch_to.window(current_handle)
             return True
 
-        # 如果有未勾选的方框，再次尝试补点
         click_custom_checkbox(sb)
         time.sleep(1.5)
 
@@ -545,7 +582,7 @@ def run():
         print("❌ 必须设置 NEOH_COOKIE 或 NEOH_AUTH")
         return 1
 
-    print("🚀 启动 NeoHeberg 自动续赚脚本 (自建方框智能穿透版)")
+    print("🚀 启动 NeoHeberg 自动续赚脚本")
     if PROXY:
         print(f"🌐 使用代理：{PROXY}")
 
@@ -580,13 +617,11 @@ def run():
             rounds = 0
             fail_streak = 0
             while True:
-                # 1. 点击 Commencer 按钮
                 if not start_round(sb):
                     if not restart_ad_flow(sb, "未能点击 Commencer"):
                         return 1
                     time.sleep(2)
 
-                # 2. 等待进入广告页面
                 if not wait_for_clipurl(sb):
                     fail_streak += 1
                     if fail_streak >= MAX_CAPTCHA_FAILURES:
@@ -594,7 +629,6 @@ def run():
                     restart_ad_flow(sb, "未进入 clipurl")
                     continue
 
-                # 3. 运行 ClipURL 4 步流
                 if not solve_clipurl_pipeline(sb):
                     fail_streak += 1
                     shot_name = f"clipurl_failed_round_{rounds + 1}.png"
