@@ -297,12 +297,8 @@ def solve_login_turnstile(sb: SB, max_retries: int = 3, wait_per_try: int = 8) -
 # 2. 广告页专属：CapJS 真实鼠标物理点击与状态监控
 # ==========================================================
 def click_cap_checkbox_physical(sb: SB) -> bool:
-    """
-    通过真实的 ActionChains 物理光标位移点击 CapJS 复选方框左侧中心
-    """
     dismiss_popups(sb)
 
-    # 1. 查找 Cap 验证组件的屏幕坐标
     coords = sb.execute_script("""
         var all = document.querySelectorAll('div, label, span, p, button, input');
         for (var i = 0; i < all.length; i++) {
@@ -328,16 +324,14 @@ def click_cap_checkbox_physical(sb: SB) -> bool:
         x = coords.get("x")
         y = coords.get("y")
         try:
-            # 真实模拟鼠标移动并点击该坐标
             actions = ActionChains(sb.driver)
             body = sb.find_element("body")
             actions.move_to_element_with_offset(body, x, y).click().perform()
             print(f"🎯 [物理点击] 成功点击 CapJS 方框物理坐标 ({x}, {y})")
             return True
         except Exception as exc:
-            print(f"⚠️ 物理点击坐标失败: {exc}，转为元素聚焦点击")
+            print(f"⚠️ 物理点击坐标失败: {exc}，转为元素直接点击")
 
-    # 备用方案：直接定位文本容器触发原生 click()
     try:
         clicked = sb.execute_script("""
             var all = document.querySelectorAll('div, label, span, p, button');
@@ -360,9 +354,6 @@ def click_cap_checkbox_physical(sb: SB) -> bool:
 
 
 def wait_and_solve_cap_step(sb: SB, step_label: str, max_wait_sec: int = 15) -> bool:
-    """
-    点击验证框并静默等待验证完成（监听步骤切换或倒计时启动）
-    """
     print(f"🛡 [{step_label}] 触发验证方框点击...")
     click_cap_checkbox_physical(sb)
 
@@ -373,20 +364,31 @@ def wait_and_solve_cap_step(sb: SB, step_label: str, max_wait_sec: int = 15) -> 
         if "dash.neoheberg.fr" in url_now and "/login" not in url_now:
             return True
 
-        # 检查是否已经跳出当前步骤（如进入倒计时 Redirection en cours 或第 2/3/4 步高亮）
+        # 修复：使用原生 JavaScript 安全检测页面推进状态
         step_passed = sb.execute_script("""
             var text = document.body ? document.body.innerText : '';
             var isCounting = text.includes('Redirection en cours') || text.includes('Veuillez patienter');
-            var isStep1Done = document.querySelector('span:contains(\"2\"), .step-active') !== null;
-            return isCounting || (window.__REDIRECT__ && window.__REDIRECT__.remaining > 0);
+            var hasRedirect = (window.__REDIRECT__ && window.__REDIRECT__.remaining > 0);
+            
+            // 检查顶部步骤是否已经点亮第 2/3/4 步
+            var spans = document.querySelectorAll('span, div');
+            var isStepMoved = false;
+            for (var i = 0; i < spans.length; i++) {
+                var t = (spans[i].innerText || '').trim();
+                if ((t === '2' || t === '3' || t === '4') && spans[i].className.includes('bg-')) {
+                    isStepMoved = true;
+                    break;
+                }
+            }
+            return isCounting || hasRedirect || isStepMoved;
         """)
+
         if step_passed:
             print(f"✅ [{step_label}] 验证成功，页面已推进！")
             return True
 
         time.sleep(1.2)
 
-    # 若等待超时未切换，补点一次
     print(f"ℹ️ [{step_label}] 再次补点一次方框...")
     click_cap_checkbox_physical(sb)
     time.sleep(2)
@@ -449,7 +451,6 @@ def login(sb):
     if not ensure_login_fields(sb):
         return False
 
-    # 登录页必须过 Cloudflare Turnstile
     solve_login_turnstile(sb, max_retries=3, wait_per_try=6)
 
     submit_selector = 'form[action="./login"] button[type="submit"]'
@@ -634,7 +635,7 @@ def run():
         print("❌ 必须设置 NEOH_COOKIE 或 NEOH_AUTH")
         return 1
 
-    print("🚀 启动 NeoHeberg 自动续赚脚本 (物理坐标精准点击版)")
+    print("🚀 启动 NeoHeberg 自动续赚脚本")
     if PROXY:
         print(f"🌐 使用代理：{PROXY}")
 
