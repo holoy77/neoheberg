@@ -18,7 +18,7 @@ PROXY = os.environ.get("PROXY", "socks://127.0.0.1:1080")
 LOGIN_TYPE = os.environ.get("NEOH_LOGIN_TYPE", "auto").strip().lower()
 TARGET_COINS = 25.0
 CHECK_EVERY_ROUNDS = 500
-MAX_CAPTCHA_FAILURES = max(int(os.environ.get("NEOH_MAX_CAPTCHA_FAILURES", "3")), 1)
+MAX_CAPTCHA_FAILURES = max(int(os.environ.get("NEOH_MAX_CAPTCHA_FAILURES", "5")), 1)
 LOGIN_TIMEOUT = min(int(os.environ.get("NEOH_LOGIN_TIMEOUT", "20")), 20)
 ROUND_TIMEOUT = int(os.environ.get("NEOH_ROUND_TIMEOUT", "600"))
 USER_AGENT = os.environ.get(
@@ -387,7 +387,6 @@ def start_round(sb):
         sb.wait_for_ready_state_complete()
         dismiss_popups(sb)
 
-    # 包含所有可能的 Commencer 按钮特征
     commencer_selectors = [
         'button[type="submit"]:contains("Commencer")',
         'button:contains("Commencer")',
@@ -396,7 +395,7 @@ def start_round(sb):
         'a.btn:contains("Commencer")',
         '.btn-success:contains("Commencer")',
         '//button[contains(translate(., "COMMENCER", "commencer"), "commencer")]',
-        '//a[contains(translate(., "COMMENCER", "commencer"), "commencer")]'
+        '//a[contains(translate(., "COMMENCER", "commencer"), "commencer")]',
     ]
 
     if not wait_until(lambda: any(bool(visible_element(sb, [sel])[0]) for sel in commencer_selectors), 15):
@@ -420,7 +419,6 @@ def wait_for_clipurl(sb):
     print("⏳ 等待跳转到 clipurl.fr...")
 
     def on_clipurl():
-        # 如果新标签页弹出了广告，自动切换
         if len(sb.driver.window_handles) > 1:
             sb.switch_to_tab(sb.driver.window_handles[-1])
         return "clipurl.fr" in urlparse(current_url(sb)).hostname
@@ -434,32 +432,35 @@ def wait_for_clipurl(sb):
 
 
 # ==========================================================
-# 核心流水线：适配新版 4 步流
+# 核心策略：遇到 Mini-jeu 直接快速回退重开
 # ==========================================================
 def solve_clipurl_pipeline(sb):
-    print("🚀 开始执行 ClipURL 4 步流程...")
+    print("🚀 开始执行 ClipURL 流程...")
     sb.wait_for_ready_state_complete()
     dismiss_popups(sb)
 
-    # 1. 步骤 1 (CAPTCHA 模拟点击验证)
-    print("🛡 [步骤 1/4] 执行首页 CAPTCHA 模拟验证...")
-    solve_turnstile(sb, max_retries=3, wait_per_try=6)
+    # 1. 检查是否存在 CAPTCHA 并处理
+    if "challenges.cloudflare.com" in sb.get_page_source():
+        print("🛡 遇到 Cloudflare CAPTCHA，执行验证...")
+        solve_turnstile(sb, max_retries=2, wait_per_try=6)
 
-    # 2. 步骤 2 (Mini-jeu 等待 5 秒自动跳转)
-    print("⏳ [步骤 2/4] 进入 Mini-jeu 阶段，等待 5~7 秒自动跳转...")
-    time.sleep(6)
-    dismiss_popups(sb)
+    # 2. 检查是否出现 Mini-jeu
+    page_text = (sb.get_page_source() or "").lower()
+    if "mini-jeu" in page_text or "attrapez la cible" in page_text or "cliquez" in page_text:
+        print("🛑 检测到 Mini-jeu（小游戏验证模式），按策略直接放弃本轮并回退重新开始！")
+        return False
 
-    # 3. 步骤 3 (Attente 模拟点击验证)
-    print("🛡 [步骤 3/4] 进入 Attente 阶段，执行模拟点击验证...")
-    solve_turnstile(sb, max_retries=3, wait_per_try=6)
+    # 3. 如果是普通 Attente / 倒计时模式，等待并处理最终验证
+    print("⏳ 处理后续步骤与最终安全验证...")
+    time.sleep(3)
+    solve_turnstile(sb, max_retries=2, wait_per_try=6)
 
-    # 4. 步骤 4 (Vérif 自动跳转回原面板)
-    print("⏳ [步骤 4/4] 等待验证完成并自动跳转回 NeoHeberg 控制台...")
-    deadline = time.monotonic() + 35.0
+    # 4. 等待跳转回 NeoHeberg
+    print("⏳ 等待页面跳转回 NeoHeberg...")
+    deadline = time.monotonic() + 25.0
     while time.monotonic() < deadline:
         dismiss_popups(sb)
-        
+
         # 检查多标签页
         if len(sb.driver.window_handles) > 1:
             for handle in sb.driver.window_handles:
@@ -470,7 +471,6 @@ def solve_clipurl_pipeline(sb):
         url = current_url(sb)
         if "dash.neoheberg.fr" in url:
             print(f"🎉 页面已成功跳转回 NeoHeberg：{url}")
-            # 如果多标签页未关闭，安全关闭子标签页
             if len(sb.driver.window_handles) > 1:
                 current_handle = sb.driver.current_window_handle
                 for handle in sb.driver.window_handles:
@@ -480,7 +480,11 @@ def solve_clipurl_pipeline(sb):
                 sb.driver.switch_to.window(current_handle)
             return True
 
-        # 如果有继续/领取按钮则触发
+        # 再次检查是否有突发 mini-jeu
+        if "mini-jeu" in (sb.get_page_source() or "").lower():
+            print("🛑 流程中途出现 Mini-jeu，立即回退重开！")
+            return False
+
         try:
             sb.execute_script("""
                 var btns = [...document.querySelectorAll('button, a')];
@@ -532,7 +536,7 @@ def run():
         print("❌ 必须设置 NEOH_COOKIE 或 NEOH_AUTH")
         return 1
 
-    print("🚀 启动 NeoHeberg 自动续赚脚本 (完整版)")
+    print("🚀 启动 NeoHeberg 自动续赚脚本 (遇 Mini-jeu 自动回退重开版)")
     if PROXY:
         print(f"🌐 使用代理：{PROXY}")
 
@@ -581,15 +585,22 @@ def run():
                     restart_ad_flow(sb, "未进入 clipurl")
                     continue
 
-                # 3. 运行 4 步流
+                # 3. 运行 ClipURL 流程（若遇到 Mini-jeu 自动返回 False 并重开）
                 if not solve_clipurl_pipeline(sb):
                     fail_streak += 1
-                    print(f"⚠️ 本轮 ClipURL 流程未成功（失败计数: {fail_streak}/{MAX_CAPTCHA_FAILURES}）")
+                    shot_name = f"clipurl_failed_round_{rounds + 1}.png"
+                    try:
+                        sb.save_screenshot(shot_name)
+                        print(f"📸 已自动保存失败现场截图：{shot_name}")
+                        send_tg_photo(shot_name, f"ClipURL 第 {rounds + 1} 轮放弃/失败重开\nURL: {current_url(sb)}")
+                    except Exception:
+                        pass
+
+                    print(f"⚠️ 本轮未完成（连续重试: {fail_streak}/{MAX_CAPTCHA_FAILURES}）")
                     if fail_streak >= MAX_CAPTCHA_FAILURES:
-                        sb.save_screenshot("neohe_pipeline_failed.png")
-                        send_tg_photo("neohe_pipeline_failed.png", "ClipURL 连续失败达到上限")
+                        print("🛑 连续失败达到上限，退出")
                         return 1
-                    restart_ad_flow(sb, "ClipURL 流程未完成")
+                    restart_ad_flow(sb, "Mini-jeu 回退或流程未完成")
                     continue
 
                 fail_streak = 0
