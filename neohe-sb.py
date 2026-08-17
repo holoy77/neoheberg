@@ -8,6 +8,7 @@ import time
 from urllib.parse import urlparse
 
 import requests
+from selenium.webdriver.common.action_chains import ActionChains
 from seleniumbase import SB
 
 NEOH_AUTH = os.environ.get("NEOH_AUTH", "")
@@ -203,7 +204,7 @@ def dismiss_popups(sb):
         """)
         if js_click:
             closed += 1
-    except:
+    except Exception:
         pass
     return closed
 
@@ -293,57 +294,103 @@ def solve_login_turnstile(sb: SB, max_retries: int = 3, wait_per_try: int = 8) -
 
 
 # ==========================================================
-# 2. 广告页专属：精准点击自建 Cap 验证方框 (图三)
+# 2. 广告页专属：CapJS 真实鼠标物理点击与状态监控
 # ==========================================================
-def click_cap_checkbox(sb: SB) -> bool:
+def click_cap_checkbox_physical(sb: SB) -> bool:
+    """
+    通过真实的 ActionChains 物理光标位移点击 CapJS 复选方框左侧中心
+    """
     dismiss_popups(sb)
 
-    # 1. 底层 JS 穿透模拟物理点击（精确寻找带有 Vérifiez que vous êtes humain 或 Cap 的勾选方框）
-    clicked = sb.execute_script("""
+    # 1. 查找 Cap 验证组件的屏幕坐标
+    coords = sb.execute_script("""
         var all = document.querySelectorAll('div, label, span, p, button, input');
         for (var i = 0; i < all.length; i++) {
             var el = all[i];
             var txt = (el.innerText || '').toLowerCase();
             if (txt.includes('vérifiez') || txt.includes('humai') || txt.includes('cap')) {
-                var box = el.querySelector('input, span, div, svg') || el;
-                box.scrollIntoView({block: 'center'});
-                var rect = box.getBoundingClientRect();
-                
-                // 模拟原生 Pointer 与 Mouse 事件
-                ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(evt => {
-                    var event = new MouseEvent(evt, {
-                        bubbles: true,
-                        cancelable: true,
-                        view: window,
-                        clientX: rect.left + 15,
-                        clientY: rect.top + rect.height / 2
-                    });
-                    box.dispatchEvent(event);
-                });
-                return true;
+                var rect = el.getBoundingClientRect();
+                if (rect.width > 20 && rect.height > 15) {
+                    el.scrollIntoView({block: 'center'});
+                    var newRect = el.getBoundingClientRect();
+                    return {
+                        found: true,
+                        x: Math.round(newRect.left + 22),
+                        y: Math.round(newRect.top + newRect.height / 2)
+                    };
+                }
             }
         }
-        return false;
+        return { found: false, x: 0, y: 0 };
     """)
 
-    if clicked:
-        print("✅ 成功命中并点击了 Cap 自建验证方框！")
-        return True
+    if coords and coords.get("found"):
+        x = coords.get("x")
+        y = coords.get("y")
+        try:
+            # 真实模拟鼠标移动并点击该坐标
+            actions = ActionChains(sb.driver)
+            body = sb.find_element("body")
+            actions.move_to_element_with_offset(body, x, y).click().perform()
+            print(f"🎯 [物理点击] 成功点击 CapJS 方框物理坐标 ({x}, {y})")
+            return True
+        except Exception as exc:
+            print(f"⚠️ 物理点击坐标失败: {exc}，转为元素聚焦点击")
 
-    # 2. 备用通用选择器点击
-    selectors = [
-        "input[type='checkbox']",
-        "label:contains('Vérifiez')",
-        "div:contains('Vérifiez que vous êtes humai')",
-        ".captcha-checkbox",
-        "#cap-checkbox",
-    ]
-    element, sel = visible_element(sb, selectors)
-    if element and click_element(sb, element, sel):
-        print(f"✅ 成功通过选择器点击验证方框：{sel}")
-        return True
+    # 备用方案：直接定位文本容器触发原生 click()
+    try:
+        clicked = sb.execute_script("""
+            var all = document.querySelectorAll('div, label, span, p, button');
+            for (var i = 0; i < all.length; i++) {
+                var el = all[i];
+                if ((el.innerText || '').includes('Vérifiez que vous êtes')) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        """)
+        if clicked:
+            print("🎯 [原生点击] 触发了包含 Vérifiez 的容器 click()")
+            return True
+    except Exception:
+        pass
 
     return False
+
+
+def wait_and_solve_cap_step(sb: SB, step_label: str, max_wait_sec: int = 15) -> bool:
+    """
+    点击验证框并静默等待验证完成（监听步骤切换或倒计时启动）
+    """
+    print(f"🛡 [{step_label}] 触发验证方框点击...")
+    click_cap_checkbox_physical(sb)
+
+    start_time = time.monotonic()
+    while time.monotonic() - start_time < max_wait_sec:
+        dismiss_popups(sb)
+        url_now = current_url(sb)
+        if "dash.neoheberg.fr" in url_now and "/login" not in url_now:
+            return True
+
+        # 检查是否已经跳出当前步骤（如进入倒计时 Redirection en cours 或第 2/3/4 步高亮）
+        step_passed = sb.execute_script("""
+            var text = document.body ? document.body.innerText : '';
+            var isCounting = text.includes('Redirection en cours') || text.includes('Veuillez patienter');
+            var isStep1Done = document.querySelector('span:contains(\"2\"), .step-active') !== null;
+            return isCounting || (window.__REDIRECT__ && window.__REDIRECT__.remaining > 0);
+        """)
+        if step_passed:
+            print(f"✅ [{step_label}] 验证成功，页面已推进！")
+            return True
+
+        time.sleep(1.2)
+
+    # 若等待超时未切换，补点一次
+    print(f"ℹ️ [{step_label}] 再次补点一次方框...")
+    click_cap_checkbox_physical(sb)
+    time.sleep(2)
+    return True
 
 
 def cookie_login(sb):
@@ -402,7 +449,7 @@ def login(sb):
     if not ensure_login_fields(sb):
         return False
 
-    # 登录页过 Cloudflare Turnstile
+    # 登录页必须过 Cloudflare Turnstile
     solve_login_turnstile(sb, max_retries=3, wait_per_try=6)
 
     submit_selector = 'form[action="./login"] button[type="submit"]'
@@ -491,21 +538,17 @@ def wait_for_clipurl(sb):
 
 
 # ==========================================================
-# 3. ClipURL 4 步流执行逻辑 (适配倒计时与自建方框)
+# 3. ClipURL 4 步流执行逻辑
 # ==========================================================
 def solve_clipurl_pipeline(sb):
     print("🚀 开始执行 ClipURL 4 步流程...")
     sb.wait_for_ready_state_complete()
     dismiss_popups(sb)
 
-    # 1. 步骤 1/4: 初始验证方框点击
-    print("🛡 [步骤 1/4] 点击首页自建验证方框...")
-    for _ in range(3):
-        if click_cap_checkbox(sb):
-            break
-        time.sleep(1)
+    # 1. 步骤 1/4: 首页 Cap 验证方框物理点击并等待
+    wait_and_solve_cap_step(sb, "步骤 1/4 (初始 CAPTCHA)", max_wait_sec=12)
 
-    # 2. 步骤 2 & 3: 监听前端倒计时（Redirection en cours / window.__REDIRECT__）
+    # 2. 步骤 2 & 3: 监听前端倒计时（Redirection en cours）
     print("⏳ [步骤 2 & 3] 监听倒计时缓冲完成...")
     start_wait = time.monotonic()
     while time.monotonic() - start_wait < 15:
@@ -516,17 +559,14 @@ def solve_clipurl_pipeline(sb):
             return text.includes('Redirection en cours') || hasRedirectObj;
         """)
         if not is_counting:
-            print("✅ 倒计时已归零/进入下一步！")
+            print("✅ 倒计时已归零！")
             break
         time.sleep(1)
 
     time.sleep(1.5)
 
-    # 3. 步骤 4/4: 点击最终 Vérif 验证方框 (图三)
-    print("🛡 [步骤 4/4] 寻找并点击最终 Vérif 验证方框...")
-    for _ in range(5):
-        click_cap_checkbox(sb)
-        time.sleep(1)
+    # 3. 步骤 4/4: 点击最终 Vérif 验证方框
+    wait_and_solve_cap_step(sb, "步骤 4/4 (最终 Vérif)", max_wait_sec=10)
 
     # 4. 等待自动跳回 NeoHeberg 控制台
     print("⏳ 等待页面跳转回 NeoHeberg 控制台...")
@@ -552,8 +592,6 @@ def solve_clipurl_pipeline(sb):
                 sb.driver.switch_to.window(current_handle)
             return True
 
-        # 如果还在原页面，尝试再次补点验证方框
-        click_cap_checkbox(sb)
         time.sleep(1.5)
 
     return "dash.neoheberg.fr" in current_url(sb) and "/login" not in current_url(sb)
@@ -596,7 +634,7 @@ def run():
         print("❌ 必须设置 NEOH_COOKIE 或 NEOH_AUTH")
         return 1
 
-    print("🚀 启动 NeoHeberg 自动续赚脚本 (完整稳定版)")
+    print("🚀 启动 NeoHeberg 自动续赚脚本 (物理坐标精准点击版)")
     if PROXY:
         print(f"🌐 使用代理：{PROXY}")
 
