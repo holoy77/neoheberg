@@ -244,7 +244,7 @@ def read_coins(sb):
 
 
 # ==========================================================
-# 1. 登录页专属：Cloudflare Turnstile 验证器
+# 1. 登录页：Cloudflare Turnstile 验证器
 # ==========================================================
 def solve_login_turnstile(sb: SB, max_retries: int = 3, wait_per_try: int = 8) -> bool:
     print("🛡 处理登录页 Cloudflare Turnstile 验证...")
@@ -295,128 +295,102 @@ def solve_login_turnstile(sb: SB, max_retries: int = 3, wait_per_try: int = 8) -
 
 
 # ==========================================================
-# 2. 广告页专属：CapJS 拟真物理光标点击与状态获取
+# 2. 广告页：精准定位 Cap 验证框并使用拟真动作链点击
 # ==========================================================
-def get_current_clipurl_step(sb: SB) -> dict:
-    """获取当前 ClipURL 页面的状态与步骤"""
-    return sb.execute_script("""
-        var text = document.body ? document.body.innerText : '';
-        var isCounting = text.includes('Redirection en cours') || text.includes('Veuillez patienter');
-        var hasRedirect = Boolean(window.__REDIRECT__ && window.__REDIRECT__.remaining > 0);
-        
-        // 查找 Cap 验证框坐标
-        var boxCoord = null;
-        var all = document.querySelectorAll('div, label, span, p, button, input');
-        for (var i = 0; i < all.length; i++) {
-            var el = all[i];
-            var txt = (el.innerText || '').toLowerCase();
-            if (txt.includes('vérifiez') || txt.includes('humai') || txt.includes('cap')) {
-                var rect = el.getBoundingClientRect();
-                if (rect.width > 20 && rect.height > 15) {
-                    el.scrollIntoView({block: 'center'});
-                    var newRect = el.getBoundingClientRect();
-                    boxCoord = {
-                        x: Math.round(newRect.left + 22),
-                        y: Math.round(newRect.top + newRect.height / 2)
-                    };
-                    break;
-                }
-            }
-        }
-        
-        // 查找最终结算/继续按钮
-        var btnCoord = null;
-        var btns = document.querySelectorAll('button, a');
-        for (var j = 0; j < btns.length; j++) {
-            var b = btns[j];
-            var btxt = (b.innerText || '').toLowerCase().trim();
-            if (btxt.includes('continuer') || btxt.includes('accéder') || btxt.includes('get link') || btxt.includes('valider') || btxt.includes('obtenir')) {
-                var bRect = b.getBoundingClientRect();
-                if (bRect.width > 10 && bRect.height > 10) {
-                    btnCoord = {
-                        x: Math.round(bRect.left + bRect.width / 2),
-                        y: Math.round(bRect.top + bRect.height / 2)
-                    };
-                    break;
-                }
-            }
-        }
-        
-        return {
-            isCounting: isCounting || hasRedirect,
-            boxCoord: boxCoord,
-            btnCoord: btnCoord
-        };
-    """)
-
-
-def click_cap_checkbox_physical(sb: SB) -> bool:
-    """平滑移动鼠标并模拟真实物理点击 Cap 验证方框"""
+def click_cap_checkbox_accurate(sb: SB) -> bool:
     dismiss_popups(sb)
-    info = get_current_clipurl_step(sb)
-    coords = info.get("boxCoord")
 
-    if coords:
-        x, y = coords["x"], coords["y"]
+    # 1. 查找最内层的 Checkbox / 方框元素
+    box_element = None
+    target_selectors = [
+        "input[type='checkbox']",
+        "div[class*='border'][class*='rounded']",
+        "span[class*='border'][class*='rounded']",
+        "#cap-checkbox",
+        ".captcha-checkbox",
+    ]
+
+    for sel in target_selectors:
         try:
-            body = sb.find_element("body")
+            elements = sb.find_elements(sel)
+            for el in elements:
+                if el.is_displayed():
+                    rect = el.rect
+                    # 验证方框的尺寸通常在 15px ~ 60px 之间
+                    if 15 <= rect.get("width", 0) <= 60 and 15 <= rect.get("height", 0) <= 60:
+                        box_element = el
+                        break
+            if box_element:
+                break
+        except Exception:
+            continue
+
+    # 2. 如果未通过特征选出，则通过文字定位其兄弟/子级方框
+    if not box_element:
+        try:
+            matched_el = sb.execute_script("""
+                var labels = document.querySelectorAll('div, label, span, p');
+                for (var i = 0; i < labels.length; i++) {
+                    var txt = (labels[i].innerText || '').trim();
+                    if (txt.includes('Vérifiez que vous êtes') || txt === 'Cap') {
+                        var card = labels[i].closest('div[class*="border"]') || labels[i].parentElement;
+                        if (card) {
+                            var box = card.querySelector('input, div, span');
+                            if (box && box !== card) return box;
+                            return card;
+                        }
+                    }
+                }
+                return null;
+            """)
+            if matched_el:
+                box_element = matched_el
+        except Exception:
+            pass
+
+    # 3. 拟真轨迹移动并执行物理点击
+    if box_element:
+        try:
+            sb.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", box_element)
+            time.sleep(0.3)
+
             actions = ActionChains(sb.driver)
-            # 先模拟随机偏移微移，再精准定位点击，防止被反爬识别为人机
-            actions.move_to_element_with_offset(body, max(1, x - random.randint(10, 30)), max(1, y - random.randint(5, 15)))
-            actions.pause(0.2)
-            actions.move_to_element_with_offset(body, x, y)
-            actions.pause(0.1)
-            actions.click()
+            # 模拟微小随机轨迹抖动
+            actions.move_to_element(box_element)
+            actions.pause(random.uniform(0.2, 0.4))
+            actions.click(box_element)
             actions.perform()
-            print(f"🎯 [物理点击] 模拟拟真光标点击 CapJS 方框 ({x}, {y})")
+            print("🎯 [拟真点击] 成功点击 CapJS 最内层方框元素")
             return True
         except Exception as exc:
-            print(f"⚠️ 物理点击失败: {exc}，尝试 JS 直接触发")
-
-    try:
-        clicked = sb.execute_script("""
-            var all = document.querySelectorAll('div, label, span, p, button');
-            for (var i = 0; i < all.length; i++) {
-                var el = all[i];
-                if ((el.innerText || '').includes('Vérifiez que vous êtes')) {
-                    el.click();
-                    return true;
-                }
-            }
-            return false;
-        """)
-        if clicked:
-            print("🎯 [原生点击] 触发了包含 Vérifiez 的容器 click()")
-            return True
-    except Exception:
-        pass
+            print(f"⚠️ ActionChains 点击失败: {exc}，尝试 JS 直接触发")
+            try:
+                sb.driver.execute_script("arguments[0].click();", box_element)
+                return True
+            except Exception:
+                pass
 
     return False
 
 
-def click_final_continue_button(sb: SB) -> bool:
-    """尝试点击结算/跳转按钮"""
-    info = get_current_clipurl_step(sb)
-    btn_coord = info.get("btnCoord")
-    if btn_coord:
-        try:
-            body = sb.find_element("body")
-            actions = ActionChains(sb.driver)
-            actions.move_to_element_with_offset(body, btn_coord["x"], btn_coord["y"]).click().perform()
-            print(f"🎉 成功点击最终跳转按钮 ({btn_coord['x']}, {btn_coord['y']})")
+def wait_cap_advancement(sb: SB, max_wait_sec: int = 15) -> bool:
+    """等待验证结果返回并推进页面"""
+    start_time = time.monotonic()
+    while time.monotonic() - start_time < max_wait_sec:
+        dismiss_popups(sb)
+        if "dash.neoheberg.fr" in current_url(sb) and "/login" not in current_url(sb):
             return True
-        except Exception:
-            pass
 
-    return sb.execute_script("""
-        var btns = [...document.querySelectorAll('button, a')];
-        var cBtn = btns.find(b => /continuer|accéder|get link|valider|obtenir|claim/i.test((b.innerText || '')));
-        if (cBtn) {
-            cBtn.click();
-            return true;
-        }
-        return false;
-    """)
+        advanced = sb.execute_script("""
+            var text = document.body ? document.body.innerText : '';
+            var isCounting = text.includes('Redirection en cours') || text.includes('Veuillez patienter');
+            var hasRedirect = Boolean(window.__REDIRECT__ && window.__REDIRECT__.remaining > 0);
+            return isCounting || hasRedirect;
+        """)
+        if advanced:
+            return True
+        time.sleep(1)
+    return False
 
 
 def cookie_login(sb):
@@ -570,37 +544,31 @@ def solve_clipurl_pipeline(sb):
     sb.wait_for_ready_state_complete()
     dismiss_popups(sb)
 
-    # 1. 步骤 1/4: 初始验证方框点击并验证状态
+    # 1. 步骤 1/4: 初始验证方框点击
     print("🛡 [步骤 1/4] 点击首页自建验证方框...")
-    clicked_step1 = False
-    for _ in range(3):
-        if click_cap_checkbox_physical(sb):
-            clicked_step1 = True
-            break
-        time.sleep(1)
-
-    if not clicked_step1:
-        print("⚠️ 未能定位到步骤 1 验证框，尝试等待页面自然加载...")
+    click_cap_checkbox_accurate(sb)
+    wait_cap_advancement(sb, max_wait_sec=8)
 
     # 2. 步骤 2 & 3: 监听倒计时（Redirection en cours）
     print("⏳ [步骤 2 & 3] 监听倒计时缓冲完成...")
     start_wait = time.monotonic()
     while time.monotonic() - start_wait < 18:
         dismiss_popups(sb)
-        status = get_current_clipurl_step(sb)
-        if not status.get("isCounting"):
-            print("✅ 倒计时已归零，进入最终步骤！")
+        is_counting = sb.execute_script("""
+            var text = document.body ? document.body.innerText : '';
+            var hasRedirect = Boolean(window.__REDIRECT__ && window.__REDIRECT__.remaining > 0);
+            return text.includes('Redirection en cours') || hasRedirect;
+        """)
+        if not is_counting:
+            print("✅ 倒计时已归零！")
             break
         time.sleep(1)
 
     time.sleep(2)
 
     # 3. 步骤 4/4: 最终 Vérif 验证
-    print("🛡 [步骤 4/4] 触发最终 Vérif 验证与继续按钮...")
-    for _ in range(3):
-        click_cap_checkbox_physical(sb)
-        click_final_continue_button(sb)
-        time.sleep(1.5)
+    print("🛡 [步骤 4/4] 触发最终 Vérif 验证...")
+    click_cap_checkbox_accurate(sb)
 
     # 4. 等待跳转回 NeoHeberg 控制台
     print("⏳ 等待页面跳转回 NeoHeberg 控制台...")
@@ -626,9 +594,13 @@ def solve_clipurl_pipeline(sb):
                 sb.driver.switch_to.window(current_handle)
             return True
 
-        # 再次尝试补点未触发的按钮或方框
-        click_final_continue_button(sb)
-        click_cap_checkbox_physical(sb)
+        # 尝试触发可能出现的继续按钮或补点方框
+        sb.execute_script("""
+            var btns = [...document.querySelectorAll('button, a')];
+            var cBtn = btns.find(b => /continuer|accéder|get link|valider|obtenir|claim/i.test((b.innerText || '')));
+            if (cBtn) cBtn.click();
+        """)
+        click_cap_checkbox_accurate(sb)
         time.sleep(1.5)
 
     return "dash.neoheberg.fr" in current_url(sb) and "/login" not in current_url(sb)
@@ -671,7 +643,7 @@ def run():
         print("❌ 必须设置 NEOH_COOKIE 或 NEOH_AUTH")
         return 1
 
-    print("🚀 启动 NeoHeberg 自动续赚脚本 (拟真物理状态流版)")
+    print("🚀 启动 NeoHeberg 自动续赚脚本 (精准拟真内层定位版)")
     if PROXY:
         print(f"🌐 使用代理：{PROXY}")
 
