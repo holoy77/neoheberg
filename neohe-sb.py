@@ -355,7 +355,6 @@ def click_cap_checkbox_accurate(sb: SB) -> bool:
             time.sleep(0.3)
 
             actions = ActionChains(sb.driver)
-            # 模拟微小随机轨迹抖动
             actions.move_to_element(box_element)
             actions.pause(random.uniform(0.2, 0.4))
             actions.click(box_element)
