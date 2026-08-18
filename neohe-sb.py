@@ -295,101 +295,86 @@ def solve_login_turnstile(sb: SB, max_retries: int = 3, wait_per_try: int = 8) -
 
 
 # ==========================================================
-# 2. 广告页：精准定位 Cap 验证框并使用拟真动作链点击
+# 2. 广告页：精准搜索指定文本并模拟点击左侧复选框
 # ==========================================================
-def click_cap_checkbox_accurate(sb: SB) -> bool:
+def click_cap_by_search_text(sb: SB) -> bool:
+    """搜索固定文字 'Vérifiez que vous êtes humai' 并模拟点击其左侧方框"""
     dismiss_popups(sb)
 
-    # 1. 查找最内层的 Checkbox / 方框元素
-    box_element = None
-    target_selectors = [
-        "input[type='checkbox']",
-        "div[class*='border'][class*='rounded']",
-        "span[class*='border'][class*='rounded']",
-        "#cap-checkbox",
-        ".captcha-checkbox",
-    ]
+    # 1. 如果已经显示 "Vous êtes humain"（已成功），直接跳过
+    already_done = sb.execute_script("""
+        var txt = document.body ? document.body.innerText : '';
+        return txt.includes('Vous êtes humain') || txt.includes('Vous etes humain');
+    """)
+    if already_done:
+        print("✅ 验证框已处于'Vous êtes humain'成功状态，无需重复点击")
+        return True
 
-    for sel in target_selectors:
-        try:
-            elements = sb.find_elements(sel)
-            for el in elements:
-                if el.is_displayed():
-                    rect = el.rect
-                    # 验证方框的尺寸通常在 15px ~ 60px 之间
-                    if 15 <= rect.get("width", 0) <= 60 and 15 <= rect.get("height", 0) <= 60:
-                        box_element = el
-                        break
-            if box_element:
-                break
-        except Exception:
-            continue
+    # 2. 精确搜索包含指定文本的元素，并触发其真实点击
+    clicked = sb.execute_script("""
+        // 查找直接包含指定文字的最深层节点
+        var xpath = "//*[contains(text(), 'Vérifiez que vous êtes') or contains(text(), 'humai')]";
+        var res = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        
+        for (var i = 0; i < res.snapshotLength; i++) {
+            var node = res.snapshotItem(i);
+            // 找到包裹该文本的卡片容器
+            var container = node.closest('div[class*="border"], div[class*="rounded"], div') || node.parentElement;
+            if (container) {
+                // 优先点击卡片内部的复选框/span，或者直接点击容器
+                var box = container.querySelector('input[type="checkbox"], span, div') || container;
+                box.scrollIntoView({block: 'center'});
+                
+                // 派发原生点击与指针事件
+                ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(function(evt) {
+                    var e = new MouseEvent(evt, { bubbles: true, cancelable: true, view: window });
+                    box.dispatchEvent(e);
+                });
+                return true;
+            }
+        }
+        return false;
+    """)
 
-    # 2. 如果未通过特征选出，则通过文字定位其兄弟/子级方框
-    if not box_element:
-        try:
-            matched_el = sb.execute_script("""
-                var labels = document.querySelectorAll('div, label, span, p');
-                for (var i = 0; i < labels.length; i++) {
-                    var txt = (labels[i].innerText || '').trim();
-                    if (txt.includes('Vérifiez que vous êtes') || txt === 'Cap') {
-                        var card = labels[i].closest('div[class*="border"]') || labels[i].parentElement;
-                        if (card) {
-                            var box = card.querySelector('input, div, span');
-                            if (box && box !== card) return box;
-                            return card;
-                        }
-                    }
-                }
-                return null;
-            """)
-            if matched_el:
-                box_element = matched_el
-        except Exception:
-            pass
-
-    # 3. 拟真轨迹移动并执行物理点击
-    if box_element:
-        try:
-            sb.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", box_element)
-            time.sleep(0.3)
-
-            actions = ActionChains(sb.driver)
-            actions.move_to_element(box_element)
-            actions.pause(random.uniform(0.2, 0.4))
-            actions.click(box_element)
-            actions.perform()
-            print("🎯 [拟真点击] 成功点击 CapJS 最内层方框元素")
-            return True
-        except Exception as exc:
-            print(f"⚠️ ActionChains 点击失败: {exc}，尝试 JS 直接触发")
-            try:
-                sb.driver.execute_script("arguments[0].click();", box_element)
-                return True
-            except Exception:
-                pass
+    if clicked:
+        print("🎯 [精准文本定位] 找到'Vérifiez que vous êtes humai'并成功触发点击！")
+        return True
 
     return False
 
 
-def wait_cap_advancement(sb: SB, max_wait_sec: int = 15) -> bool:
-    """等待验证结果返回并推进页面"""
+def wait_and_verify_cap(sb: SB, max_wait_sec: int = 15) -> bool:
+    """点击一次后，静默等待 PoW 运算与接口响应，不再重复打断"""
+    if not click_cap_by_search_text(sb):
+        return False
+
+    print("⏳ 等待 PoW 运算与 verify 请求响应完成...")
     start_time = time.monotonic()
     while time.monotonic() - start_time < max_wait_sec:
         dismiss_popups(sb)
+        
+        # 判断是否成功：文本变成 "Vous êtes humain" 或页面已自动跳走/进入倒计时
+        status = sb.execute_script("""
+            var txt = document.body ? document.body.innerText : '';
+            var isSolved = txt.includes('Vous êtes humain') || txt.includes('Vous etes humain');
+            var isCounting = txt.includes('Redirection en cours') || txt.includes('Veuillez patienter');
+            var hasRedirect = Boolean(window.__REDIRECT__ && window.__REDIRECT__.remaining > 0);
+            return isSolved || isCounting || hasRedirect;
+        """)
+
+        if status:
+            print("✅ 验证已成功通过 (已变为'Vous êtes humain'或页面推进)！")
+            return True
+
         if "dash.neoheberg.fr" in current_url(sb) and "/login" not in current_url(sb):
             return True
 
-        advanced = sb.execute_script("""
-            var text = document.body ? document.body.innerText : '';
-            var isCounting = text.includes('Redirection en cours') || text.includes('Veuillez patienter');
-            var hasRedirect = Boolean(window.__REDIRECT__ && window.__REDIRECT__.remaining > 0);
-            return isCounting || hasRedirect;
-        """)
-        if advanced:
-            return True
         time.sleep(1)
-    return False
+
+    print("⚠️ 等待超时，尝试补点一次")
+    click_cap_by_search_text(sb)
+    time.sleep(2)
+    return True
 
 
 def cookie_login(sb):
@@ -543,10 +528,9 @@ def solve_clipurl_pipeline(sb):
     sb.wait_for_ready_state_complete()
     dismiss_popups(sb)
 
-    # 1. 步骤 1/4: 初始验证方框点击
-    print("🛡 [步骤 1/4] 点击首页自建验证方框...")
-    click_cap_checkbox_accurate(sb)
-    wait_cap_advancement(sb, max_wait_sec=8)
+    # 1. 步骤 1/4: 初始验证方框点击（搜索固定文字并静默等待完成）
+    print("🛡 [步骤 1/4] 定位并点击初始验证方框...")
+    wait_and_verify_cap(sb, max_wait_sec=12)
 
     # 2. 步骤 2 & 3: 监听倒计时（Redirection en cours）
     print("⏳ [步骤 2 & 3] 监听倒计时缓冲完成...")
@@ -566,8 +550,8 @@ def solve_clipurl_pipeline(sb):
     time.sleep(2)
 
     # 3. 步骤 4/4: 最终 Vérif 验证
-    print("🛡 [步骤 4/4] 触发最终 Vérif 验证...")
-    click_cap_checkbox_accurate(sb)
+    print("🛡 [步骤 4/4] 定位并触发最终 Vérif 验证...")
+    wait_and_verify_cap(sb, max_wait_sec=10)
 
     # 4. 等待跳转回 NeoHeberg 控制台
     print("⏳ 等待页面跳转回 NeoHeberg 控制台...")
@@ -593,14 +577,13 @@ def solve_clipurl_pipeline(sb):
                 sb.driver.switch_to.window(current_handle)
             return True
 
-        # 尝试触发可能出现的继续按钮或补点方框
+        # 尝试触发可能出现的继续按钮
         sb.execute_script("""
             var btns = [...document.querySelectorAll('button, a')];
             var cBtn = btns.find(b => /continuer|accéder|get link|valider|obtenir|claim/i.test((b.innerText || '')));
             if (cBtn) cBtn.click();
         """)
-        click_cap_checkbox_accurate(sb)
-        time.sleep(1.5)
+        time.sleep(2)
 
     return "dash.neoheberg.fr" in current_url(sb) and "/login" not in current_url(sb)
 
@@ -642,7 +625,7 @@ def run():
         print("❌ 必须设置 NEOH_COOKIE 或 NEOH_AUTH")
         return 1
 
-    print("🚀 启动 NeoHeberg 自动续赚脚本 (精准拟真内层定位版)")
+    print("🚀 启动 NeoHeberg 自动续赚脚本 (固定文本精准定位版)")
     if PROXY:
         print(f"🌐 使用代理：{PROXY}")
 
